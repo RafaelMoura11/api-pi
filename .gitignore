@@ -1,0 +1,11 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+.env
+*.pkl
+
+# os/ide
+.DS_Store
+.vscode/
+.idea/
