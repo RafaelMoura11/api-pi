@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import os, joblib, pandas as pd
 import datetime
 
@@ -6,6 +7,16 @@ MODEL_PATH = os.environ.get("MODEL_PATH", "model.pkl")
 HISTORY_PATH = os.environ.get("HISTORY_PATH", "history.parquet")
 
 app = Flask(__name__)
+
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+origins = [o.strip() for o in ALLOWED_ORIGINS.split(",")] if ALLOWED_ORIGINS != "*" else "*"
+
+CORS(
+    app,
+    resources={r"/*": {"origins": origins}},
+    supports_credentials=False,          # deixe True só se o front usar cookies/credenciais
+    expose_headers=["Content-Type"]      # opcional
+)
 
 # Carrega modelo (simples). Se preferir, troque por lazy-load.
 model = joblib.load(MODEL_PATH)
