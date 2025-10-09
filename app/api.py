@@ -4,18 +4,21 @@ import os
 import datetime
 import joblib
 import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 
-# ====== Config por ENV ======
+# ========= Config por ENV =========
 MODEL_PATH = os.environ.get("MODEL_PATH", "model.pkl")
 HISTORY_PATH = os.environ.get("HISTORY_PATH", "history.parquet")
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")  # deixe "*" para acesso aberto
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")  # "*" = aberto para qualquer origem
 
-# ====== App & CORS ======
+# ========= App & CORS =========
 app = Flask(__name__)
 origins = [o.strip() for o in ALLOWED_ORIGINS.split(",")] if ALLOWED_ORIGINS != "*" else "*"
 CORS(app, resources={r"/*": {"origins": origins}}, supports_credentials=False)
 
-# ====== Carregamento lazy do modelo ======
+# ========= Modelo (lazy load) =========
 _model = None
 _model_error = None
 def ensure_model():
@@ -26,7 +29,7 @@ def ensure_model():
         except Exception as e:
             _model_error = str(e)
 
-# ====== Histórico (observado) carregado ao subir ======
+# ========= Histórico observado (carregado ao subir) =========
 _history = None
 _history_error = None
 try:
@@ -40,7 +43,7 @@ try:
 except Exception as e:
     _history_error = str(e)
 
-# ====== Helpers ======
+# ========= Helpers =========
 def prev_year_month(year: int, month: int) -> tuple[int, int]:
     dt = datetime.date(int(year), int(month), 1)
     prev = dt.replace(day=1) - datetime.timedelta(days=1)
@@ -55,18 +58,29 @@ def get_observed(bairro: str, year: int, month: int):
     return float(_history.loc[m, "crime_count"].iloc[0])
 
 def infer_previous_count(bairro: str, year: int, month: int):
+    """
+    Descobre previous_month_crime_count.
+    Retorna (valor, fonte) onde fonte ∈ {"history","bairro_median","global_median", None}
+    """
     if _history is None or len(_history) == 0:
         return (None, None)
+
     py, pm = prev_year_month(year, month)
+
+    # 1) Histórico do mês anterior
     val = get_observed(bairro, py, pm)
     if val is not None:
         return (val, "history")
+
+    # 2) Fallback: mediana do bairro
     hb = _history[_history["bairro"] == bairro]
     if not hb.empty:
         return (float(hb["crime_count"].median()), "bairro_median")
+
+    # 3) Fallback global
     return (float(_history["crime_count"].median()), "global_median")
 
-# ====== Endpoints ======
+# ========= Endpoints =========
 @app.get("/health")
 def health():
     ensure_model()
@@ -80,6 +94,10 @@ def health():
 
 @app.post("/predict")
 def predict():
+    """
+    Predição pontual. Accepta previous_month_crime_count explicitamente;
+    se não vier, a API infere do histórico.
+    """
     ensure_model()
     if _model is None:
         return jsonify({"error": f"Modelo indisponível: {_model_error}"}), 503
@@ -120,7 +138,7 @@ def predict():
 @app.get("/year/summary")
 def year_summary():
     """
-    Retorna meses 'observed' e 'non_observed' (preenchidos por previsão) num JSON simplificado.
+    Retorna meses 'observed' (histórico) e 'non_observed' (previsão) num JSON simplificado.
 
     Query:
       - year (obrigatório) -> int
@@ -147,7 +165,7 @@ def year_summary():
     if not year:
         return jsonify({"error": "Parâmetro 'year' é obrigatório (ex.: ?year=2025)"}), 400
 
-    # bairros
+    # bairros (lista ou CSV)
     bairros = request.args.getlist("bairro")
     if len(bairros) == 1 and "," in bairros[0]:
         bairros = [b.strip() for b in bairros[0].split(",") if b.strip()]
@@ -170,27 +188,25 @@ def year_summary():
             if observed is not None:
                 rows.append({
                     "bairro": bairro, "month": m,
-                    "value": observed, "value_type": "observed"
+                    "value": float(observed), "value_type": "observed"
                 })
-                last_value_cache[bairro][m] = observed
+                last_value_cache[bairro][m] = float(observed)
                 continue
 
-            # previsões forcadas para não observados
+            # Sem observado: prever (forçado)
             if (m - 1) in last_value_cache[bairro]:
                 prev_used = last_value_cache[bairro][m - 1]
             else:
                 prev_used, _ = infer_previous_count(bairro, year, m)
                 if prev_used is None:
-                    # não conseguimos prever este mês; simplesmente não incluímos
+                    # sem como estimar: pula (não entra em data)
                     continue
 
-            X = pd.DataFrame([{
-                "bairro": bairro,
-                "year": year,
-                "month": m,
+            Xp = pd.DataFrame([{
+                "bairro": bairro, "year": year, "month": m,
                 "previous_month_crime_count": float(prev_used),
             }])
-            yhat = float(_model.predict(X)[0])
+            yhat = float(_model.predict(Xp)[0])
 
             rows.append({
                 "bairro": bairro, "month": m,
@@ -201,9 +217,93 @@ def year_summary():
     # aplica filtro de value_type
     rows = [r for r in rows if r["value_type"] in allowed_types]
 
-    # resposta simplificada
     return jsonify({
         "year": year,
         "bairros": bairros,
         "data": rows
     })
+
+@app.get("/pca")
+def pca_endpoint():
+    """
+    Exemplo:
+      GET /pca?year=2025&bairro=Boa%20Viagem
+      GET /pca?year=2025&bairro=Boa%20Viagem&bairro=Casa%20Forte
+
+    Retorna SOMENTE:
+      { "pca1": [..], "pca2": [..] }
+    A ordem dos pontos é estável: ordenado por (bairro, month).
+    """
+    ensure_model()
+    if _model is None:
+        return jsonify({"error": f"Modelo indisponível: {_model_error}"}), 503
+    if _history is None:
+        return jsonify({"error": "Histórico indisponível no servidor.", "history_error": _history_error}), 503
+
+    year = request.args.get("year", type=int)
+    if not year:
+        return jsonify({"error": "Parâmetro 'year' é obrigatório (ex.: ?year=2025)"}), 400
+
+    # bairros (lista ou CSV)
+    bairros = request.args.getlist("bairro")
+    if len(bairros) == 1 and "," in bairros[0]:
+        bairros = [b.strip() for b in bairros[0].split(",") if b.strip()]
+    if not bairros:
+        bairros = sorted(_history["bairro"].dropna().unique().tolist())
+
+    # monta 'value' (observado ou previsão) para cada mês
+    rows = []
+    last_value_cache: dict[str, dict[int, float]] = {b: {} for b in bairros}
+
+    for bairro in bairros:
+        for m in range(1, 13):
+            obs = get_observed(bairro, year, m)
+            if obs is not None:
+                rows.append({"bairro": bairro, "month": m, "value": float(obs)})
+                last_value_cache[bairro][m] = float(obs)
+                continue
+
+            # previsão encadeada quando possível
+            if (m - 1) in last_value_cache[bairro]:
+                prev_used = last_value_cache[bairro][m - 1]
+            else:
+                prev_used, _ = infer_previous_count(bairro, year, m)
+                if prev_used is None:
+                    # sem como estimar: pula
+                    continue
+
+            Xp = pd.DataFrame([{
+                "bairro": bairro, "year": year, "month": m,
+                "previous_month_crime_count": float(prev_used),
+            }])
+            yhat = float(_model.predict(Xp)[0])
+            rows.append({"bairro": bairro, "month": m, "value": yhat})
+            last_value_cache[bairro][m] = yhat
+
+    if len(rows) < 2:
+        return jsonify({"error": "Amostras insuficientes para PCA. Tente mais bairros/ano."}), 400
+
+    # DataFrame e ordem estável
+    dfp = pd.DataFrame(rows).sort_values(["bairro", "month"]).reset_index(drop=True)
+
+    # Features: value + sazonalidade (sen/cos do mês)
+    theta = 2 * np.pi * (dfp["month"].astype(float) - 1) / 12.0  # mês 1..12 -> 0..2π
+    dfp["month_sin"] = np.sin(theta)
+    dfp["month_cos"] = np.cos(theta)
+
+    X = dfp[["value", "month_sin", "month_cos"]].to_numpy(dtype=float)
+
+    # Escala + PCA(2)
+    X_scaled = StandardScaler().fit_transform(X)
+    pca = PCA(n_components=2, random_state=42)
+    X_pca = pca.fit_transform(X_scaled)
+
+    return jsonify({
+        "pca1": X_pca[:, 0].astype(float).tolist(),
+        "pca2": X_pca[:, 1].astype(float).tolist()
+    })
+
+# ========= Main (para dev local) =========
+if __name__ == "__main__":
+    # DEV local: python app/api.py
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=True)
