@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
 
 # ========= Config por ENV =========
 MODEL_PATH = os.environ.get("MODEL_PATH", "model.pkl")
@@ -95,7 +96,7 @@ def health():
 @app.post("/predict")
 def predict():
     """
-    Predição pontual. Accepta previous_month_crime_count explicitamente;
+    Predição pontual. Aceita previous_month_crime_count explicitamente;
     se não vier, a API infere do histórico.
     """
     ensure_model()
@@ -226,13 +227,16 @@ def year_summary():
 @app.get("/pca")
 def pca_endpoint():
     """
-    Exemplo:
-      GET /pca?year=2025&bairro=Boa%20Viagem
-      GET /pca?year=2025&bairro=Boa%20Viagem&bairro=Casa%20Forte
+    Ex:
+      GET /pca?year=2025&bairro=Boa%20Viagem         # k=3 (padrão)
+      GET /pca?year=2025&bairro=Boa%20Viagem&k=3
 
-    Retorna SOMENTE:
-      { "pca1": [..], "pca2": [..] }
-    A ordem dos pontos é estável: ordenado por (bairro, month).
+    Retorna:
+      { "pca1": [...], "pca2": [...], "cluster": [0,2,1,...] }
+
+    Observação:
+      - Ordem estável dos pontos: ordenado por (bairro, month).
+      - Clusters alinhados com pca1/pca2 (mesmo índice).
     """
     ensure_model()
     if _model is None:
@@ -244,6 +248,10 @@ def pca_endpoint():
     if not year:
         return jsonify({"error": "Parâmetro 'year' é obrigatório (ex.: ?year=2025)"}), 400
 
+    k = request.args.get("k", default=3, type=int)
+    if k < 2 or k > 10:
+        return jsonify({"error": "Parâmetro 'k' deve estar entre 2 e 10.", "k": k}), 400
+
     # bairros (lista ou CSV)
     bairros = request.args.getlist("bairro")
     if len(bairros) == 1 and "," in bairros[0]:
@@ -251,7 +259,7 @@ def pca_endpoint():
     if not bairros:
         bairros = sorted(_history["bairro"].dropna().unique().tolist())
 
-    # monta 'value' (observado ou previsão) para cada mês
+    # monta 'value' (observado ou previsão) para cada mês, com ordem estável (bairro, month)
     rows = []
     last_value_cache: dict[str, dict[int, float]] = {b: {} for b in bairros}
 
@@ -269,7 +277,6 @@ def pca_endpoint():
             else:
                 prev_used, _ = infer_previous_count(bairro, year, m)
                 if prev_used is None:
-                    # sem como estimar: pula
                     continue
 
             Xp = pd.DataFrame([{
@@ -280,27 +287,33 @@ def pca_endpoint():
             rows.append({"bairro": bairro, "month": m, "value": yhat})
             last_value_cache[bairro][m] = yhat
 
-    if len(rows) < 2:
-        return jsonify({"error": "Amostras insuficientes para PCA. Tente mais bairros/ano."}), 400
+    if len(rows) < k:
+        return jsonify({"error": "Amostras insuficientes para clusterização/PCA.", "n_samples": len(rows), "k": k}), 400
 
-    # DataFrame e ordem estável
     dfp = pd.DataFrame(rows).sort_values(["bairro", "month"]).reset_index(drop=True)
 
-    # Features: value + sazonalidade (sen/cos do mês)
-    theta = 2 * np.pi * (dfp["month"].astype(float) - 1) / 12.0  # mês 1..12 -> 0..2π
+    # Features numéricas para cluster/PCA: value + sazonalidade (sen/cos de mês)
+    theta = 2 * np.pi * (dfp["month"].astype(float) - 1) / 12.0
     dfp["month_sin"] = np.sin(theta)
     dfp["month_cos"] = np.cos(theta)
 
     X = dfp[["value", "month_sin", "month_cos"]].to_numpy(dtype=float)
 
-    # Escala + PCA(2)
+    # Escala
     X_scaled = StandardScaler().fit_transform(X)
+
+    # ---- KMeans nos dados escalados (k=3 por padrão) ----
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = km.fit_predict(X_scaled)
+
+    # ---- PCA 2D para visualização (mesmo X_scaled) ----
     pca = PCA(n_components=2, random_state=42)
     X_pca = pca.fit_transform(X_scaled)
 
     return jsonify({
         "pca1": X_pca[:, 0].astype(float).tolist(),
-        "pca2": X_pca[:, 1].astype(float).tolist()
+        "pca2": X_pca[:, 1].astype(float).tolist(),
+        "cluster": labels.astype(int).tolist()
     })
 
 # ========= Main (para dev local) =========
